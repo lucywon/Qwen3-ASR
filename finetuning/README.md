@@ -51,6 +51,20 @@ Note:
 
 ### 3) Fine-tune (single GPU)
 
+By default, the script performs **full fine-tuning** (all `requires_grad=True` parameters are updated).
+
+You can also switch to multiple training modes inspired by common train-utils patterns:
+
+- `--train_mode full`: full-parameter update (default)
+- `--train_mode freeze`: freeze all parameters, then only unfreeze parameters matching regex patterns in `--trainable_param_patterns`
+- `--train_mode lora`: parameter-efficient LoRA fine-tuning (requires `peft`)
+
+The script will print a trainable-parameter summary before training:
+
+```text
+[trainable_params] trainable=... total=... ratio=...%
+```
+
 ```bash
 python qwen3_asr_sft.py \
   --model_path Qwen/Qwen3-ASR-1.7B \
@@ -62,6 +76,33 @@ python qwen3_asr_sft.py \
   --epochs 1 \
   --save_steps 200 \
   --save_total_limit 5
+```
+
+Example for freeze mode (only train selected parameter groups):
+
+```bash
+python qwen3_asr_sft.py \
+  --model_path Qwen/Qwen3-ASR-1.7B \
+  --train_file ./train.jsonl \
+  --output_dir ./qwen3-asr-finetuning-out \
+  --train_mode freeze \
+  --trainable_param_patterns "lm_head,audio_projector"
+```
+
+Example for LoRA mode:
+
+```bash
+pip install -U peft
+
+python qwen3_asr_sft.py \
+  --model_path Qwen/Qwen3-ASR-1.7B \
+  --train_file ./train.jsonl \
+  --output_dir ./qwen3-asr-finetuning-out \
+  --train_mode lora \
+  --lora_r 16 \
+  --lora_alpha 32 \
+  --lora_dropout 0.05 \
+  --lora_target_modules "q_proj,k_proj,v_proj,o_proj,up_proj,gate_proj,down_proj"
 ```
 
 Checkpoints will be written to:
