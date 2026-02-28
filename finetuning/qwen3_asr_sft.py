@@ -18,6 +18,8 @@ import os
 import re
 import shutil
 from dataclasses import dataclass
+from functools import reduce
+from operator import mul
 from typing import Any, Dict, List, Optional
 
 import librosa
@@ -184,6 +186,90 @@ def copy_required_hf_files_for_qwen_asr(src_dir: str, dst_dir: str):
             shutil.copy2(src, os.path.join(dst_dir, fn))
 
 
+def _numel(param: torch.nn.Parameter) -> int:
+    if hasattr(param, "ds_numel"):
+        return int(param.ds_numel)
+    if getattr(param, "numel", None) is not None:
+        return int(param.numel())
+    return int(reduce(mul, param.size(), 1))
+
+
+def print_trainable_parameters_summary(model: torch.nn.Module, max_names: int = 30):
+    total_params, trainable_params = 0, 0
+    trainable_names, frozen_names = [], []
+    for name, p in model.named_parameters():
+        n = _numel(p)
+        total_params += n
+        if p.requires_grad:
+            trainable_params += n
+            if len(trainable_names) < max_names:
+                trainable_names.append(name)
+        else:
+            if len(frozen_names) < max_names:
+                frozen_names.append(name)
+
+    ratio = (trainable_params / total_params * 100.0) if total_params > 0 else 0.0
+    print(
+        f"[trainable_params] trainable={trainable_params:,} total={total_params:,} "
+        f"ratio={ratio:.4f}%"
+    )
+    print(f"[trainable_params] sample_trainable_names({len(trainable_names)}): {trainable_names}")
+    print(f"[trainable_params] sample_frozen_names({len(frozen_names)}): {frozen_names}")
+
+
+def set_trainable_by_patterns(model: torch.nn.Module, patterns: List[str]):
+    regexes = [re.compile(p) for p in patterns]
+    for _, p in model.named_parameters():
+        p.requires_grad = False
+
+    matched = []
+    for name, p in model.named_parameters():
+        if any(r.search(name) for r in regexes):
+            p.requires_grad = True
+            matched.append(name)
+
+    if not matched:
+        raise ValueError(
+            "No parameters matched --trainable_param_patterns. "
+            "Please provide valid regex patterns separated by commas."
+        )
+
+    print(f"[train_mode] set trainable by patterns: {patterns}")
+
+
+def apply_lora_if_needed(model: torch.nn.Module, args_cli):
+    if args_cli.train_mode != "lora":
+        return model
+
+    try:
+        from peft import LoraConfig, TaskType, get_peft_model
+    except Exception as e:
+        raise RuntimeError(
+            "train_mode=lora requires the `peft` package. "
+            "Please install with: pip install -U peft"
+        ) from e
+
+    targets = [m.strip() for m in args_cli.lora_target_modules.split(",") if m.strip()]
+    if not targets:
+        raise ValueError("--lora_target_modules must not be empty when train_mode=lora")
+
+    lora_config = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        r=args_cli.lora_r,
+        lora_alpha=args_cli.lora_alpha,
+        lora_dropout=args_cli.lora_dropout,
+        target_modules=targets,
+        bias="none",
+    )
+    model = get_peft_model(model, lora_config)
+    print(
+        "[train_mode] apply LoRA with "
+        f"r={args_cli.lora_r}, alpha={args_cli.lora_alpha}, "
+        f"dropout={args_cli.lora_dropout}, target_modules={targets}"
+    )
+    return model
+
+
 class MakeEveryCheckpointInferableCallback(TrainerCallback):
     def __init__(self, base_model_path: str):
         self.base_model_path = base_model_path
@@ -236,6 +322,34 @@ def parse_args():
     p.add_argument("--resume_from", type=str, default="")
     p.add_argument("--resume", type=int, default=0)
 
+    # Train mode
+    p.add_argument(
+        "--train_mode",
+        type=str,
+        default="full",
+        choices=["full", "freeze", "lora"],
+        help=(
+            "full: all parameters trainable; "
+            "freeze: freeze all then unfreeze --trainable_param_patterns; "
+            "lora: inject LoRA adapters (requires peft)"
+        ),
+    )
+    p.add_argument(
+        "--trainable_param_patterns",
+        type=str,
+        default="",
+        help="Comma-separated regex patterns of parameter names to keep trainable when train_mode=freeze",
+    )
+    p.add_argument("--lora_r", type=int, default=16)
+    p.add_argument("--lora_alpha", type=int, default=32)
+    p.add_argument("--lora_dropout", type=float, default=0.05)
+    p.add_argument(
+        "--lora_target_modules",
+        type=str,
+        default="q_proj,k_proj,v_proj,o_proj,up_proj,gate_proj,down_proj",
+        help="Comma-separated module names for LoRA target modules",
+    )
+
     return p.parse_args()
 
 
@@ -255,6 +369,18 @@ def main():
     processor = asr_wrapper.processor
 
     patch_outer_forward(model)
+    if args_cli.train_mode == "freeze":
+        patterns = [p.strip() for p in args_cli.trainable_param_patterns.split(",") if p.strip()]
+        if not patterns:
+            raise ValueError(
+                "train_mode=freeze requires --trainable_param_patterns, "
+                "e.g. 'lm_head|audio_projector'"
+            )
+        set_trainable_by_patterns(model, patterns)
+
+    model = apply_lora_if_needed(model, args_cli)
+    print_trainable_parameters_summary(model)
+
     model.generation_config = GenerationConfig.from_model_config(model.config)
 
     raw_ds = load_dataset(
